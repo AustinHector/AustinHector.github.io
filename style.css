@@ -1,0 +1,16 @@
+:root { --cream: #F5F0E6; --paper: #FFFDF8; --line: #E0D8C8; --ink: #1E2A22; --muted: #5C635B; --forest: #1F4D3A; --brass: #B8934A; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--cream); color: var(--ink); font-family: "Source Sans 3", "Helvetica Neue", Arial, sans-serif; font-size: 17px; line-height: 1.55; }
+main { max-width: 720px; margin: 0 auto; padding: 48px 24px 80px; }
+h1, h2 { font-family: "Cormorant Garamond", Georgia, "Times New Roman", serif; font-weight: 700; line-height: 1.1; margin: 0 0 12px; }
+h1 { font-size: 44px; }
+h2 { font-size: 28px; margin-top: 36px; }
+p, li { color: var(--ink); }
+.muted { color: var(--muted); }
+a { color: var(--forest); }
+header { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+header .mark { width: 40px; height: 40px; border-radius: 10px; background: linear-gradient(135deg, #163A2C, #1F4D3A); }
+header .name { font-family: "Cormorant Garamond", Georgia, serif; font-size: 26px; font-weight: 700; }
+nav a { margin-right: 16px; }
+.card { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 20px 24px; margin: 20px 0; }
+footer { margin-top: 48px; color: var(--muted); font-size: 14px; }
