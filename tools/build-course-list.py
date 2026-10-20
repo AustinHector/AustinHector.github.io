@@ -4,8 +4,9 @@
 Usage:
   build-course-list.py [--input FILE] [--output FILE] [--min-courses N]
 
-Without --input it queries Overpass, backing off exponentially, then falls back to a
-second endpoint. The output file is replaced only when every publish check passes;
+Without --input it queries Overpass as 48 bounding boxes, one at a time, each backing
+off exponentially and then falling back to a second endpoint; one box failing fails the
+run. The output file is replaced only when every publish check passes;
 a failed check exits non-zero and leaves the old file alone.
 """
 
@@ -21,16 +22,21 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-QUERY = ('[out:json][timeout:900];'
-         '(way["leisure"="golf_course"];relation["leisure"="golf_course"];);'
-         'out tags center;')
+BOX_QUERY = ('[out:json][timeout:300];'
+             '(way["leisure"="golf_course"](%(box)s);'
+             'relation["leisure"="golf_course"](%(box)s););'
+             'out tags center;')
+LAT_BANDS = 6
+LON_BANDS = 8
+BOX_PAUSE = 5
 ENDPOINTS = ["https://overpass-api.de/api/interpreter",
              "https://overpass.private.coffee/api/interpreter"]
 USER_AGENT = "RoundReplay course list builder (austinhect@gmail.com)"
 RETRY_CODES = (429, 502, 503, 504)
 ATTEMPTS_PER_ENDPOINT = 6
+BOX_ATTEMPTS_PER_ENDPOINT = 4
 FIRST_BACKOFF = 30
-REQUEST_TIMEOUT = 1000
+REQUEST_TIMEOUT = 400
 ATTRIBUTION = "© OpenStreetMap contributors, ODbL 1.0"
 DEFAULT_OUTPUT = "roundreplay/courses-v1.json"
 DEFAULT_MIN_COURSES = 30000
@@ -45,29 +51,103 @@ class PublishError(Exception):
     pass
 
 
-def fetch_overpass(query, opener=urllib.request.urlopen, sleep=time.sleep):
-    """POST the query; returns the response body bytes or raises FetchError."""
+class BadBody(Exception):
+    """A response that arrived but must be retried."""
+
+
+def fetch_overpass(query, opener=urllib.request.urlopen, sleep=time.sleep,
+                   attempts=ATTEMPTS_PER_ENDPOINT, validate=None, on_attempt=None):
+    """POST the query; returns the response body bytes or raises FetchError.
+
+    validate(body) may raise BadBody to make the attempt count as retryable.
+    on_attempt() is called before each request.
+    """
     payload = urllib.parse.urlencode({"data": query}).encode("utf-8")
     last = None
     for url in ENDPOINTS:
         delay = FIRST_BACKOFF
-        for attempt in range(ATTEMPTS_PER_ENDPOINT):
+        for attempt in range(attempts):
             request = urllib.request.Request(
                 url, data=payload, headers={"User-Agent": USER_AGENT})
+            if on_attempt:
+                on_attempt()
             try:
                 with opener(request, timeout=REQUEST_TIMEOUT) as reply:
-                    return reply.read()
+                    body = reply.read()
+                if validate:
+                    validate(body)
+                return body
             except urllib.error.HTTPError as error:
                 last = "%s: HTTP %d" % (url, error.code)
                 if error.code not in RETRY_CODES:
                     break
-            except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            except (urllib.error.URLError, http.client.HTTPException, OSError,
+                    BadBody) as error:
                 last = "%s: %s" % (url, error)
             print("fetch failed (%s)" % last, file=sys.stderr)
-            if attempt < ATTEMPTS_PER_ENDPOINT - 1:
+            if attempt < attempts - 1:
                 sleep(delay)
                 delay *= 2
     raise FetchError("all endpoints failed; last error: %s" % last)
+
+
+def grid_boxes():
+    """The 48 (south, west, north, east) boxes covering the globe, row by row."""
+    lat_step = 180 // LAT_BANDS
+    lon_step = 360 // LON_BANDS
+    return [(-90 + i * lat_step, -180 + j * lon_step,
+             -90 + (i + 1) * lat_step, -180 + (j + 1) * lon_step)
+            for i in range(LAT_BANDS) for j in range(LON_BANDS)]
+
+
+def check_box_body(body):
+    """Raises BadBody for a box response that cannot be used; returns the parsed data."""
+    try:
+        data = json.loads(body)
+    except ValueError as error:
+        raise BadBody("response is not JSON: %s" % error)
+    if not isinstance(data, dict):
+        raise BadBody("response is not a JSON object")
+    if data.get("remark"):
+        raise BadBody("server remark: %s" % data["remark"])
+    if not isinstance(data.get("elements"), list):
+        raise BadBody("response has no elements")
+    return data
+
+
+def fetch_world(opener=urllib.request.urlopen, sleep=time.sleep):
+    """Query every box in turn; returns one merged response-shaped dict.
+
+    All or nothing: a box that fails every attempt raises FetchError naming it.
+    """
+    boxes = grid_boxes()
+    merged = {}
+    bases = []
+    for index, box in enumerate(boxes, 1):
+        if index > 1:
+            sleep(BOX_PAUSE)
+        label = "box %d/%d (%s)" % (index, len(boxes), ",".join(str(v) for v in box))
+        query = BOX_QUERY % {"box": ",".join(str(v) for v in box)}
+        attempts = []
+        started = time.monotonic()
+        try:
+            body = fetch_overpass(query, opener=opener, sleep=sleep,
+                                  attempts=BOX_ATTEMPTS_PER_ENDPOINT,
+                                  validate=check_box_body,
+                                  on_attempt=lambda: attempts.append(1))
+        except FetchError as error:
+            raise FetchError("%s failed: %s" % (label, error))
+        data = check_box_body(body)
+        for e in data["elements"]:
+            merged[(e.get("type"), e.get("id"))] = e
+        base = (data.get("osm3s") or {}).get("timestamp_osm_base", "")
+        if base:
+            bases.append(base)
+        print("%s: %d elements, %d attempts, %.1f s"
+              % (label, len(data["elements"]), len(attempts),
+                 time.monotonic() - started))
+    return {"osm3s": {"timestamp_osm_base": min(bases) if bases else ""},
+            "elements": list(merged.values())}
 
 
 def build_rows(elements):
@@ -145,12 +225,12 @@ def main(argv=None, opener=urllib.request.urlopen, sleep=time.sleep):
         if args.input:
             with open(args.input, "rb") as f:
                 body = f.read()
+            try:
+                data = json.loads(body)
+            except ValueError as error:
+                raise PublishError("response is not JSON: %s" % error)
         else:
-            body = fetch_overpass(QUERY, opener=opener, sleep=sleep)
-        try:
-            data = json.loads(body)
-        except ValueError as error:
-            raise PublishError("response is not JSON: %s" % error)
+            data = fetch_world(opener=opener, sleep=sleep)
         generated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         # Validate shape and remark before building rows.
         check_publish(data, args.min_courses, None, args.min_courses)
